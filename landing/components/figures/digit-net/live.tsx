@@ -1,655 +1,298 @@
 "use client";
 
 import * as React from "react";
-import { Plate } from "../../iso/react/draw";
-import { asksForStillness, spring, useInView, useLoop, useReadout, type Spring } from "../../iso/react/live";
-import type { NodeArt, RackArt } from "./art";
-import { rodOf } from "./frame";
 import { forward, imageOf, layersOf, type Pass, type Stroke, type WeightsJson } from "./model";
+import { COUNTS, GRAPH, INFERENCE_INTERVAL, MOBILE_GRAPH, X, pathOf, pointOf, routeOf, valuesOf, type Selection } from "./network";
 import { SAMPLES, TOUR } from "./samples";
-import { EZ, FULL, HEIGHT, LIFT, PUCK_H, PUCK_REST, WIDTH, WIRE_FULL, at, lift } from "./view";
+import { SignalFlow } from "./signal-flow";
 import weightsJson from "./weights.json";
 
 const LAYERS = layersOf(weightsJson as WeightsJson);
 const PAD = 280;
-const HOP = 0.24; // seconds for the signal to cross one web
-const WRITE = 1.5; // seconds the tour takes to write a digit
-const HOLD = 2.6; // seconds it shows the reading
-const IDLE = 1.4;
-const RESUME = 3.6;
-const CLEAR = 0.45;
-const PEN = PAD * 0.072;
+const EMPTY = valuesOf(null);
+const clamp = (v: number) => Math.max(0, Math.min(1, v));
+const decimal = (v: number, digits = 3) => v.toLocaleString("vi-VN", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+const percent = (v: number) => `${decimal(v * 100, 1)} %`;
+const sampleOf = (digit: number): Stroke[] => SAMPLES[digit].map((s) => s.map(([x, y]) => [x * PAD / 100, y * PAD / 100]));
+const passOf = (strokes: Stroke[]) => { const image = imageOf(strokes); return image ? forward(LAYERS, image) : null; };
+const INITIAL = sampleOf(7);
+const INITIAL_PASS = passOf(INITIAL);
 
-type LayerKey = "h1" | "h2" | "out";
-const KEYS: LayerKey[] = ["h1", "h2", "out"];
+// Every path is a real weight in the loaded model, including all 12,544 input edges.
+const EDGES = [false, true].map((mobile) => LAYERS.map((layer, li) => Array.from({ length: layer.in * layer.out }, (_, i) => {
+  const from = Math.floor(i / layer.out);
+  const to = i % layer.out;
+  const route = routeOf(li, from, to, mobile);
+  return { from, to, weight: layer.w[i], route, d: li ? pathOf(route) : "" };
+})));
 
-interface Live {
-  strokes: Stroke[];
-  drawing: boolean;
-  dirty: boolean;
-  pass: Pass | null;
-  shown: Record<LayerKey, Float32Array>; // targets the pucks are released to, layer by layer
-  springs: Record<LayerKey, Spring[]>;
-  cascade: number; // seconds since the last pulse started, or Infinity
-  template: number; // h1 neuron whose weights show on the plate, or -1
-  tour: { on: boolean; digit: number; t: number; step: number; idle: number };
-  touched: number; // seconds since the last interaction
-  winner: number;
-  said: string;
-}
+function Network({ pass, selection, select, drawing, input, controls, sample }: { pass: Pass | null; selection: Selection | null; select: (s: Selection | null) => void; drawing: boolean; input: React.ReactNode; controls: React.ReactNode; sample: number | null }) {
+  const focused = selection !== null;
+  const [mobile, setMobile] = React.useState(false);
+  const graph = mobile ? MOBILE_GRAPH : GRAPH;
+  const edgesByLayer = EDGES[mobile ? 1 : 0];
+  const inputBox = mobile ? { x: 240, y: 105, width: 320, height: 320 } : { x: 29, y: 185, width: 148, height: 148 };
+  const note = mobile ? { x: 400, y: 94 } : { x: 104, y: 355 };
+  const controlsY = mobile ? 180 : 366;
+  const answer = mobile ? { x: 350, y: 1070 } : { x: 678, y: 425 };
+  React.useEffect(() => {
+    const query = window.matchMedia("(max-width: 640px)");
+    const update = () => setMobile(query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
+  const canvas = React.useRef<HTMLCanvasElement>(null);
+  const redraw = React.useRef<() => void>(() => {});
+  const values = pass ? valuesOf(pass) : EMPTY;
+  const maxima = values.map((v) => Math.max(...v, 0.001));
 
-const zeros = (n: number) => new Float32Array(n);
-const springsOf = (n: number) => Array.from({ length: n }, () => ({ at: 0, rate: 0 }));
-const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
-
-function tokenOf(element: Element | null, name: string, fallback: string) {
-  if (!element) return fallback;
-  return getComputedStyle(element).getPropertyValue(name).trim() || fallback;
-}
-
-function rgbOf(color: string): [number, number, number] {
-  const hex = color.replace("#", "");
-  if (/^[0-9a-f]{6}$/i.test(hex)) return [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16)) as [number, number, number];
-  const m = color.match(/\d+(\.\d+)?/g);
-  return m ? [Number(m[0]), Number(m[1]), Number(m[2])] : [128, 128, 128];
-}
-
-// The part of a stroke list the tour has written after `share` of its length.
-function partOf(strokes: Stroke[], share: number): Stroke[] {
-  const lengths = strokes.map((s) => s.slice(1).reduce((sum, p, i) => sum + Math.hypot(p[0] - s[i][0], p[1] - s[i][1]), 0));
-  let budget = lengths.reduce((a, b) => a + b, 0) * share;
-  const out: Stroke[] = [];
-  strokes.forEach((s, n) => {
-    if (budget <= 0) return;
-    if (budget >= lengths[n]) {
-      out.push(s);
-      budget -= lengths[n];
-      return;
-    }
-    const part: Stroke = [s[0]];
-    for (let i = 1; i < s.length && budget > 0; i++) {
-      const step = Math.hypot(s[i][0] - s[i - 1][0], s[i][1] - s[i - 1][1]);
-      if (step <= budget) {
-        part.push(s[i]);
-        budget -= step;
-      } else {
-        const t = budget / step;
-        part.push([s[i - 1][0] + (s[i][0] - s[i - 1][0]) * t, s[i - 1][1] + (s[i][1] - s[i - 1][1]) * t]);
-        budget = 0;
-      }
-    }
-    out.push(part);
-  });
-  return out;
-}
-
-const toPad = (strokes: Stroke[]): Stroke[] => strokes.map((s) => s.map(([x, y]) => [x * (PAD / 100), y * (PAD / 100)] as [number, number]));
-
-export function DigitNetLive({ intro, base, webs, plate, racks, result, segments, accuracy }: { intro: React.ReactNode; base: React.ReactNode; webs: React.ReactNode; plate: React.ReactNode; racks: RackArt[]; result: React.ReactNode; segments: string[]; accuracy: string }) {
-  const { anchor: stage, say } = useReadout<HTMLDivElement>();
-  const svg = React.useRef<SVGSVGElement>(null);
-  const pad = React.useRef<HTMLCanvasElement>(null);
-  const live = React.useRef<HTMLSpanElement>(null);
-  const answer = React.useRef<HTMLDivElement>(null);
-  const field = React.useRef<HTMLCanvasElement | null>(null);
-  const nodes = React.useRef<Record<string, { puck: SVGGElement | null; rod: SVGGElement | null }>>({});
-  const wires = React.useRef<Record<LayerKey, { el: SVGPathElement; spark: SVGPathElement; from: number; to: number; w: number; alpha: number }[]>>({ h1: [], h2: [], out: [] });
-  const groups = React.useRef<Record<LayerKey, SVGGElement | null>>({ h1: null, h2: null, out: null });
-  const display = React.useRef<{ segs: Record<string, SVGPathElement>; bars: { el: SVGPathElement; base: number[]; top: number[]; p: number }[]; wires: { el: SVGPathElement; spark: SVGPathElement; alpha: number }[]; group: SVGGElement | null; shown: number }>({ segs: {}, bars: [], wires: [], group: null, shown: -2 });
-  const visible = useInView(stage);
-  const state = React.useRef<Live>({
-    strokes: [],
-    drawing: false,
-    dirty: false,
-    pass: null,
-    shown: { h1: zeros(16), h2: zeros(16), out: zeros(10) },
-    springs: { h1: springsOf(16), h2: springsOf(16), out: springsOf(10) },
-    cascade: Infinity,
-    template: -1,
-    tour: { on: true, digit: 0, t: 0, step: 0, idle: IDLE },
-    touched: 99,
-    winner: -1,
-    said: "",
-  });
-
-  // ---- Painting: the pad and the image on the plate ----------------------------------------
-  const paintPad = React.useCallback(() => {
-    const canvas = pad.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
+  React.useEffect(() => {
+    const el = canvas.current;
+    if (!el) return;
+    const ctx = el.getContext("2d");
     if (!ctx) return;
+    const draw = () => {
+      const ratio = Math.min(window.devicePixelRatio || 1, 2);
+      el.width = Math.round(el.clientWidth * ratio);
+      el.height = Math.round(el.clientHeight * ratio);
+      ctx.setTransform(el.width / graph.width, 0, 0, el.height / graph.height, 0, 0);
+      ctx.clearRect(0, 0, graph.width, graph.height);
+      ctx.strokeStyle = getComputedStyle(el).getPropertyValue("--ink").trim();
+      let largest = 0.001;
+      for (const edge of edgesByLayer[0]) largest = Math.max(largest, Math.abs(edge.weight * (pass?.input[edge.from] ?? 0)));
+      for (const edge of edgesByLayer[0]) {
+        const active = Math.abs(edge.weight * (pass?.input[edge.from] ?? 0)) / largest;
+        const related = selection?.layer === 1 && selection?.index === edge.to;
+        ctx.globalAlpha = focused ? (related ? 0.025 + active * 0.85 : 0.002) : 0.007 + active * 0.13;
+        ctx.lineWidth = related && focused ? 0.8 : 0.45;
+        ctx.setLineDash(edge.weight < 0 ? [2, 3] : []);
+        ctx.beginPath();
+        const [start, first, second, end] = edge.route;
+        ctx.moveTo(...start);
+        ctx.bezierCurveTo(...first, ...second, ...end);
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    };
+    redraw.current = draw;
+    draw();
+  }, [pass, selection, focused, edgesByLayer, graph]);
+
+  React.useEffect(() => {
+    if (!canvas.current) return;
+    const observer = new ResizeObserver(() => redraw.current());
+    observer.observe(canvas.current);
+    return () => observer.disconnect();
+  }, []);
+
+  function onNodeKey(event: React.KeyboardEvent<SVGGElement>, layer: number, index: number) {
+    if (["Enter", " "].includes(event.key)) { event.preventDefault(); select(selection?.layer === layer && selection.index === index ? null : { layer, index }); }
+    if (event.key === "Escape") select(null);
+    if (event.key.startsWith("Arrow")) {
+      event.preventDefault();
+      const nextLayer = Math.max(1, Math.min(3, layer + (event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0)));
+      const nextIndex = (Math.min(index, COUNTS[nextLayer] - 1) + (event.key === "ArrowDown" ? 1 : event.key === "ArrowUp" ? -1 : 0) + COUNTS[nextLayer]) % COUNTS[nextLayer];
+      select({ layer: nextLayer, index: nextIndex });
+      event.currentTarget.ownerSVGElement?.querySelector<SVGGElement>(`[data-node="${nextLayer}-${nextIndex}"]`)?.focus();
+    }
+  }
+
+  return <div className="dn-network" data-has-input={Boolean(pass)} data-drawing={drawing} style={{ aspectRatio: `${graph.width}/${graph.height}` }}>
+    <canvas ref={canvas} className="dn-input-wires" aria-hidden="true" data-connections={edgesByLayer[0].length} />
+    <svg viewBox={`0 0 ${graph.width} ${graph.height}`} className="dn-svg" role="group" aria-label="Mạng thật: 784 điểm ảnh, 16 nơ-ron lớp 1, 16 nơ-ron lớp 2, 10 đầu ra. Chọn nơ-ron để làm nổi bật dây nối thật. Viết trực tiếp vào ô đầu vào.">
+      {edgesByLayer.slice(1).map((edges, k) => {
+        const layer = k + 1;
+        const source = values[layer];
+        const largest = Math.max(...edges.map((e) => Math.abs(e.weight * source[e.from])), 0.001);
+        return <g key={layer} className="dn-connections" data-layer={layer}>
+          {edges.map((edge) => {
+            const contribution = edge.weight * source[edge.from];
+            const intensity = Math.abs(contribution) / largest;
+            const related = (selection?.layer === layer && selection?.index === edge.from) || (selection?.layer === layer + 1 && selection?.index === edge.to);
+            return <path key={`${edge.from}-${edge.to}`} d={edge.d} className="dn-wire" data-from={edge.from} data-to={edge.to} data-weight={edge.weight} data-contribution={contribution} data-negative={edge.weight < 0} strokeWidth={0.45 + intensity * 0.9} opacity={focused ? related ? 0.12 + intensity * 0.88 : 0.025 : 0.045 + intensity * 0.65} />;
+          })}
+        </g>;
+      })}
+      <SignalFlow pass={pass} layers={LAYERS} mobile={mobile} />
+      <g className="dn-layer-headings" aria-hidden="true">
+        {["ĐẦU VÀO", "LỚP ẨN 01", "LỚP ẨN 02", "ĐẦU RA"].map((label, layer) => {
+          const x = mobile ? 400 : layer ? X[layer] : 104;
+          const y = mobile ? [34, 530, 730, 920][layer] : 34;
+          return <g key={label}>
+            {mobile && layer > 0 && <rect x={x - 120} y={y - 20} width="240" height="50" rx="5" />}
+            <text x={x} y={y} textAnchor="middle">{label}</text>
+            <text className="dn-layer-count" x={x} y={y + 24} textAnchor="middle">{["28 × 28 · Viết tại đây", "16 nơ-ron", "16 nơ-ron", "0 — 9"][layer]}</text>
+          </g>;
+        })}
+      </g>
+      <rect className="dn-pixel-paper" {...inputBox} rx="18" />
+      <g className="dn-input-grid" aria-label="784 điểm ảnh thực sự truyền vào mô hình" data-input-grid="true">
+        {Array.from({ length: 784 }, (_, i) => {
+          const [x, y] = pointOf(0, i, mobile);
+          return <rect key={i} x={x - (mobile ? 4 : 1.65)} y={y - (mobile ? 4 : 1.65)} width={mobile ? 8 : 3.3} height={mobile ? 8 : 3.3} rx="0.5" className="dn-pixel" opacity={0.05 + values[0][i] * 0.95} data-value={values[0][i]} />;
+        })}
+      </g>
+      <foreignObject {...inputBox} className="dn-input-pad">{input}</foreignObject>
+      <text className="dn-input-note" x={note.x} y={note.y} textAnchor="middle">{drawing ? "Đang đọc nét viết…" : sample !== null ? `Nét mẫu · ${sample}` : pass ? "Nét viết của bạn" : "Viết số tại đây"}</text>
+      <foreignObject x={mobile ? 600 : inputBox.x - 16} y={controlsY} width="180" height={mobile ? 200 : 52}>{controls}</foreignObject>
+      {[1, 2, 3].map((layer) => <g key={layer} data-neuron-layer={layer}>
+        {Array.from({ length: COUNTS[layer] }, (_, index) => {
+          const [x, y] = pointOf(layer, index, mobile);
+          const value = values[layer][index];
+          const intensity = clamp(value / maxima[layer]);
+          const selected = selection?.layer === layer && selection?.index === index;
+          const winner = layer === 3 && pass?.digit === index;
+          return <g key={index} className="dn-node" data-node={`${layer}-${index}`} data-value={value} data-selected={selected} data-winner={winner} role="button" tabIndex={selected || (!selection && layer === 1 && index === 0) ? 0 : -1} aria-pressed={selected} aria-label={`${layer === 3 ? `Chữ số ${index}, xác suất ${percent(value)}` : `Lớp ${layer}, nơ-ron ${index + 1}, kích hoạt ${decimal(value)}`}. Enter để làm nổi bật dây nối, phím mũi tên để di chuyển, Esc để xem toàn mạng.`} onClick={() => select(selected ? null : { layer, index })} onKeyDown={(e) => onNodeKey(e, layer, index)}>
+            <title>{layer === 3 ? `Số ${index}: ${percent(value)}` : `Lớp ${layer} · nơ-ron ${index + 1}: ${decimal(value, 5)}`}</title>
+            <circle cx={x} cy={y} r="12" fill="transparent" />
+            <circle className="dn-node-shell" cx={x} cy={y} r="8.5" />
+            <circle className="dn-node-ring" cx={x} cy={y} r="11" />
+            <circle className="dn-node-dot" cx={x} cy={y} r={2.5 + intensity * 3.5} opacity={0.2 + intensity * 0.8} />
+            {layer === 3 && <g aria-hidden="true">
+              <text className="dn-output-number" x={mobile ? x - 4 : x + 17} y={mobile ? y + 26 : y + 4}>{index}</text>
+              <rect className="dn-prob-track" x={mobile ? x - 17 : x + 34} y={mobile ? y + 35 : y - 2} width="34" height="3" rx="1.5" />
+              <rect className="dn-prob-bar" x={mobile ? x - 17 : x + 34} y={mobile ? y + 35 : y - 2} width={34 * value} height="3" rx="1.5" />
+              <text className="dn-prob-label" x={mobile ? x : x + 113} y={mobile ? y + 56 : y + 3} textAnchor={mobile ? "middle" : "end"}>{pass ? `${decimal(value * 100, 1)}%` : "—"}</text>
+            </g>}
+          </g>;
+        })}
+      </g>)}
+      <g className="dn-answer" data-empty={!pass} aria-label="Kết quả dự đoán">
+        <text className="dn-answer-label" x={answer.x} y={answer.y}>MẠNG ĐOÁN</text>
+        <text className="dn-predicted-digit" x={answer.x - 3} y={answer.y + 58}>{pass ? pass.digit : "—"}</text>
+        <text className="dn-confidence" x={answer.x + (mobile ? 70 : 52)} y={answer.y + 41}>{pass ? percent(pass.probs[pass.digit]) : "—"}</text>
+      </g>
+    </svg>
+  </div>;
+}
+
+export function DigitNetLive({ intro }: { intro: React.ReactNode }) {
+  const [pass, setPass] = React.useState<Pass | null>(INITIAL_PASS);
+  const [selection, setSelection] = React.useState<Selection | null>(null);
+  const [sample, setSample] = React.useState<number | null>(7);
+  const [drawing, setDrawing] = React.useState(false);
+  const pad = React.useRef<HTMLCanvasElement>(null);
+  const strokes = React.useRef<Stroke[]>(INITIAL.map((s) => s.map(([x, y]) => [x, y])));
+  const pointer = React.useRef<number | null>(null);
+  const frame = React.useRef<number | null>(null);
+  const inferenceTimer = React.useRef<number | null>(null);
+  const lastInference = React.useRef(-Infinity);
+  const tour = React.useRef(1);
+
+  const paint = React.useCallback(() => {
+    const canvas = pad.current;
+    const ctx = canvas?.getContext("2d");
+    if (!canvas || !ctx) return;
     const ratio = canvas.width / PAD;
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     ctx.clearRect(0, 0, PAD, PAD);
-    ctx.strokeStyle = tokenOf(canvas, "--anatomy-hi", "#222");
+    ctx.strokeStyle = getComputedStyle(canvas).getPropertyValue("--ink").trim();
     ctx.fillStyle = ctx.strokeStyle;
-    ctx.lineWidth = PEN;
+    ctx.lineWidth = PAD * 0.072;
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
-    for (const s of state.current.strokes) {
-      if (s.length === 1) {
-        ctx.beginPath();
-        ctx.arc(s[0][0], s[0][1], PEN / 2, 0, Math.PI * 2);
-        ctx.fill();
-        continue;
-      }
+    for (const stroke of strokes.current) {
       ctx.beginPath();
-      ctx.moveTo(s[0][0], s[0][1]);
-      for (let i = 1; i < s.length - 1; i++) {
-        const mx = (s[i][0] + s[i + 1][0]) / 2;
-        const my = (s[i][1] + s[i + 1][1]) / 2;
-        ctx.quadraticCurveTo(s[i][0], s[i][1], mx, my);
-      }
-      const last = s[s.length - 1];
-      ctx.lineTo(last[0], last[1]);
+      if (stroke.length === 1) { ctx.arc(stroke[0][0], stroke[0][1], ctx.lineWidth / 2, 0, Math.PI * 2); ctx.fill(); continue; }
+      stroke.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
       ctx.stroke();
     }
   }, []);
 
-  const paintField = React.useCallback(() => {
-    const root = svg.current;
-    const image = root?.querySelector<SVGImageElement>("[data-field]");
-    if (!root || !image) return;
-    if (!field.current) {
-      field.current = document.createElement("canvas");
-      field.current.width = 28;
-      field.current.height = 28;
-    }
-    const ctx = field.current.getContext("2d");
-    if (!ctx) return;
-    const s = state.current;
-    const out = ctx.createImageData(28, 28);
-    const ink = rgbOf(tokenOf(root, "--dn-pos", "#222"));
-    const neg = rgbOf(tokenOf(root, "--dn-neg", "#c33"));
-    if (s.template >= 0) {
-      const layer = LAYERS[0];
-      let most = 0;
-      for (let i = 0; i < 784; i++) most = Math.max(most, Math.abs(layer.w[i * 16 + s.template]));
-      for (let i = 0; i < 784; i++) {
-        const v = layer.w[i * 16 + s.template] / most;
-        const c = v >= 0 ? ink : neg;
-        out.data.set([c[0], c[1], c[2], Math.round(clamp01(Math.abs(v) * 1.4) * 255)], i * 4);
-      }
-    } else if (s.pass) {
-      for (let i = 0; i < 784; i++) out.data.set([ink[0], ink[1], ink[2], Math.round(s.pass.input[i] * 255)], i * 4);
-    }
-    ctx.putImageData(out, 0, 0);
-    image.setAttribute("href", field.current.toDataURL());
-  }, []);
+  const update = React.useCallback(() => {
+    if (frame.current !== null) cancelAnimationFrame(frame.current);
+    frame.current = null;
+    if (inferenceTimer.current !== null) window.clearTimeout(inferenceTimer.current);
+    inferenceTimer.current = null;
+    paint();
+    lastInference.current = performance.now();
+    setPass(passOf(strokes.current));
+  }, [paint]);
 
-  // ---- The network -----------------------------------------------------------------------
-  const recompute = React.useCallback(() => {
-    const s = state.current;
-    const image = imageOf(s.strokes);
-    s.pass = image ? forward(LAYERS, image) : null;
-    s.dirty = false;
-    paintField();
-  }, [paintField]);
-
-  // A spark runs along the wires that carry the most of each layer's input, one web after another.
-  const pulse = React.useCallback(() => {
-    const s = state.current;
-    s.cascade = asksForStillness() || !s.pass ? Infinity : 0;
-    const pass = s.pass;
-    if (!pass) return;
-    const acts = [pass.input, pass.h1, pass.h2];
-    KEYS.forEach((key, n) => {
-      const list = wires.current[key].map((wire) => ({ wire, c: n === 0 ? pass.h1[wire.to] : Math.abs(wire.w) * acts[n][wire.from] }));
-      const top = [...list].sort((a, b) => b.c - a.c).slice(0, n === 0 ? 6 : 12);
-      const most = top[0]?.c || 1;
-      for (const { wire } of list) wire.spark.style.opacity = "0";
-      for (const { wire, c } of top) if (c > 0) wire.spark.style.opacity = (0.35 + 0.65 * (c / most)).toFixed(2);
-    });
-    display.current.wires.forEach((wire, i) => (wire.spark.style.opacity = i === pass.digit ? "1" : "0"));
-  }, []);
-
-  const racksByKey = React.useMemo(() => {
-    const map: Record<string, NodeArt> = {};
-    for (const rack of racks) for (const node of rack.nodes) map[node.key] = node;
-    return map;
-  }, [racks]);
-
-  const draw = React.useCallback(
-    (dt: number, calm: boolean) => {
-      const s = state.current;
-      const pass = s.pass;
-      const target: Record<LayerKey, ArrayLike<number>> = {
-        h1: pass ? pass.h1 : zeros(16),
-        h2: pass ? pass.h2 : zeros(16),
-        out: pass ? pass.probs : zeros(10),
-      };
-      // Release each layer's targets when the signal reaches it; drawing by hand releases at once.
-      if (Number.isFinite(s.cascade)) s.cascade += dt;
-      const reached = (n: number) => s.drawing || calm || !Number.isFinite(s.cascade) || s.cascade >= HOP * (n + 1);
-      let moving = false;
-      KEYS.forEach((key, n) => {
-        if (reached(n)) s.shown[key] = Float32Array.from(target[key]);
-        const group = groups.current[key];
-        const run = s.drawing || calm || !Number.isFinite(s.cascade) ? 1 : clamp01((s.cascade - HOP * n) / HOP);
-        // The spark's head travels source → target (pathLength 100) and its tail follows it in.
-        if (group) group.style.setProperty("--spark", run >= 1 ? "-120" : String(Math.round(14 - run * 114)));
-        if (run < 1) moving = true;
-      });
-      KEYS.forEach((key) => {
-        const springs = s.springs[key];
-        springs.forEach((sp, i) => {
-          const goal = clamp01(s.shown[key][i] / FULL[key]);
-          if (!spring(sp, goal, dt, 260, 24, calm)) moving = true;
-          const ref = nodes.current[`${key}-${i}`];
-          if (!ref) return;
-          const z = LIFT * Math.max(0, sp.at);
-          ref.puck?.setAttribute("transform", lift(z));
-          const glow = ref.puck?.querySelector<SVGPathElement>(".dn-glow");
-          if (glow) glow.style.opacity = (0.7 * clamp01(sp.at)).toFixed(3);
-          if (ref.rod) {
-            const node = racksByKey[`${key}-${i}`];
-            const paths = rodOf(node.x, node.y, z);
-            const [fill, side, outline] = Array.from(ref.rod.children) as SVGPathElement[];
-            fill.setAttribute("d", paths.fill);
-            side.setAttribute("d", paths.side);
-            outline.setAttribute("d", paths.outline);
-          }
-        });
-      });
-      // Wire ink: how much each wire contributes to the neuron it feeds, |w · a|.
-      KEYS.forEach((key, n) => {
-        const source = n === 0 ? null : s.springs[KEYS[n - 1]];
-        const scale = n === 0 ? 1 : FULL[KEYS[n - 1]];
-        for (const wire of wires.current[key]) {
-          const alpha = n === 0 ? clamp01(s.springs.h1[wire.to].at) : clamp01((Math.abs(wire.w) * Math.max(0, source![wire.from].at) * scale) / WIRE_FULL[key]);
-          if (Math.abs(alpha - wire.alpha) > 0.01 || (alpha === 0 && wire.alpha !== 0)) {
-            wire.alpha = alpha;
-            wire.el.style.opacity = (alpha * 0.95).toFixed(2);
-          }
-        }
-      });
-      // The winner is read from where the output pucks are, not from the target.
-      const outs = s.springs.out.map((sp) => sp.at);
-      let winner = -1;
-      if (pass) {
-        winner = 0;
-        for (let i = 1; i < 10; i++) if (outs[i] > outs[winner]) winner = i;
-        if (outs[winner] < 0.05) winner = -1;
-      }
-      if (winner !== s.winner) {
-        const old = nodes.current[`out-${s.winner}`]?.puck?.querySelector(".iso-solid");
-        old?.removeAttribute("data-lit");
-        nodes.current[`out-${winner}`]?.puck?.querySelector(".iso-solid")?.setAttribute("data-lit", "");
-        s.winner = winner;
-      }
-      // The result display: ten bars from the output pucks, the digit when the signal arrives.
-      const d = display.current;
-      d.bars.forEach((bar, i) => {
-        const p = clamp01(outs[i]);
-        if (Math.abs(p - bar.p) > 0.002 || (p === 0 && bar.p !== 0)) {
-          bar.p = p;
-          const x = bar.base[0] + (bar.top[0] - bar.base[0]) * p;
-          const y = bar.base[1] + (bar.top[1] - bar.base[1]) * p;
-          bar.el.setAttribute("d", `M${bar.base[0]} ${bar.base[1]}L${x.toFixed(1)} ${y.toFixed(1)}`);
-        }
-        bar.el.toggleAttribute("data-win", i === winner);
-      });
-      d.wires.forEach((wire, i) => {
-        const alpha = clamp01(outs[i]);
-        if (Math.abs(alpha - wire.alpha) > 0.01 || (alpha === 0 && wire.alpha !== 0)) {
-          wire.alpha = alpha;
-          wire.el.style.opacity = (alpha * 0.95).toFixed(2);
-        }
-      });
-      const run = s.drawing || calm || !Number.isFinite(s.cascade) ? 1 : clamp01((s.cascade - HOP * 3) / HOP);
-      if (d.group) d.group.style.setProperty("--spark", run >= 1 ? "-120" : String(Math.round(14 - run * 114)));
-      if (run < 1) moving = true;
-      const lit = run >= 1 ? winner : d.shown;
-      if (lit !== d.shown) {
-        d.shown = lit;
-        const on = lit >= 0 ? segments[lit] : "";
-        for (const [name, el] of Object.entries(d.segs)) el.toggleAttribute("data-on", on.includes(name));
-      }
-      say(winner < 0 ? "chưa có nét nào" : `đoán ${winner} · ${Math.round(clamp01(outs[winner]) * 100)}%`);
-      const card = answer.current;
-      if (card) {
-        const digit = lit >= 0 ? String(lit) : "–";
-        const pct = winner >= 0 ? `${Math.round(clamp01(outs[winner]) * 100)}%` : "";
-        const [big, small] = card.querySelectorAll("b, i");
-        if (big.textContent !== digit) big.textContent = digit;
-        if (small.textContent !== pct) small.textContent = pct;
-        card.toggleAttribute("data-empty", lit < 0);
-      }
-      return moving;
-    },
-    [say, racksByKey, segments],
-  );
-
-  const announce = React.useCallback(() => {
-    const s = state.current;
-    const text = s.pass ? `Mạng đoán số ${s.pass.digit}, độ tin cậy ${Math.round(s.pass.probs[s.pass.digit] * 100)} phần trăm` : "Bàn vẽ trống";
-    if (text !== s.said && live.current) {
-      s.said = text;
-      live.current.textContent = text;
-    }
-  }, []);
-
-  // ---- Tour -------------------------------------------------------------------------------
-  const tourTick = React.useCallback(
-    (dt: number) => {
-      const s = state.current;
-      const t = s.tour;
-      s.touched += dt;
-      if (!t.on) {
-        if (!s.drawing && !s.strokes.length && s.touched > RESUME) {
-          t.on = true;
-          t.t = 0;
-          t.idle = IDLE;
-        } else return false;
-      }
-      // The tour holds still while someone looks at a neuron's weights.
-      if (s.template >= 0) return true;
-      if (t.idle > 0) {
-        t.idle -= dt;
-        return true;
-      }
-      t.t += dt;
-      const digit = TOUR[t.step % TOUR.length];
-      const strokes = toPad(SAMPLES[digit]);
-      if (t.t <= WRITE) {
-        s.strokes = partOf(strokes, t.t / WRITE);
-        s.drawing = true;
-        s.dirty = true;
-      } else if (s.drawing) {
-        s.strokes = strokes;
-        s.drawing = false;
-        s.dirty = true;
-        recompute();
-        pulse();
-        announce();
-      } else if (t.t > WRITE + HOLD) {
-        s.strokes = [];
-        s.dirty = true;
-        t.step += 1;
-        t.t = 0;
-        t.idle = CLEAR;
-      }
-      return true;
-    },
-    [announce, pulse, recompute],
-  );
-
-  const kick = useLoop((dt, calm) => {
-    const s = state.current;
-    const touring = !calm && tourTick(dt);
-    if (s.dirty) {
-      recompute();
-      paintPad();
-    }
-    const moving = draw(dt, calm);
-    return touring || moving || s.drawing || s.touched < RESUME + 0.1;
-  }, visible);
-
-  // ---- Wiring up the DOM ------------------------------------------------------------------
   React.useEffect(() => {
-    const root = svg.current;
-    if (!root) return;
-    KEYS.forEach((key, n) => {
-      const group = root.querySelector<SVGGElement>(`.dn-web[data-web="${key}"]`);
-      groups.current[key] = group;
-      const layer = LAYERS[n];
-      const sparks = Array.from(group?.querySelectorAll<SVGPathElement>(".dn-spark") ?? []);
-      wires.current[key] = Array.from(group?.querySelectorAll<SVGPathElement>(".dn-wire") ?? []).map((el, at) => {
-        const from = Number(el.dataset.from);
-        const to = Number(el.dataset.to);
-        const w = n === 0 ? 1 : layer.w[from * layer.out + to];
-        el.dataset.sign = w >= 0 ? "+" : "-";
-        return { el, spark: sparks[at], from, to, w, alpha: 0 };
-      });
-    });
-    const d = display.current;
-    root.querySelectorAll<SVGPathElement>(".dn-seg").forEach((el) => (d.segs[el.dataset.seg!] = el));
-    d.bars = Array.from(root.querySelectorAll<SVGPathElement>(".dn-bar")).map((el) => ({
-      el,
-      base: el.dataset.base!.split(" ").map(Number),
-      top: el.dataset.top!.split(" ").map(Number),
-      p: 0,
-    }));
-    d.group = root.querySelector<SVGGElement>('.dn-web[data-web="res"]');
-    const resSparks = Array.from(d.group?.querySelectorAll<SVGPathElement>(".dn-spark") ?? []);
-    d.wires = Array.from(d.group?.querySelectorAll<SVGPathElement>(".dn-wire") ?? []).map((el, i) => ({ el, spark: resSparks[i], alpha: 0 }));
-    const canvas = pad.current;
-    if (canvas) {
-      const ratio = Math.min(2, window.devicePixelRatio || 1);
-      canvas.width = Math.round(PAD * ratio);
-      canvas.height = Math.round(PAD * ratio);
-    }
-    if (asksForStillness()) {
-      // Reduced motion: no tour; show one written digit, still and readable.
-      const s = state.current;
-      s.tour.on = false;
-      s.touched = 0;
-      s.strokes = toPad(SAMPLES[3]);
-      recompute();
-    }
-    paintPad();
-    const themes = window.matchMedia("(prefers-color-scheme: dark)");
-    const repaint = () => requestAnimationFrame(() => {
-      paintPad();
-      paintField();
-    });
-    themes.addEventListener("change", repaint);
-    const observer = new MutationObserver(repaint);
-    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
-    return () => {
-      themes.removeEventListener("change", repaint);
-      observer.disconnect();
+    const resize = () => {
+      if (!pad.current) return;
+      pad.current.width = pad.current.height = Math.round(PAD * Math.min(window.devicePixelRatio || 1, 2));
+      paint();
     };
-  }, [paintField, paintPad, recompute]);
+    resize();
+    window.addEventListener("resize", resize);
+    return () => {
+      window.removeEventListener("resize", resize);
+      if (frame.current !== null) cancelAnimationFrame(frame.current);
+      if (inferenceTimer.current !== null) window.clearTimeout(inferenceTimer.current);
+    };
+  }, [paint]);
 
-  const touch = React.useCallback(() => {
-    const s = state.current;
-    s.touched = 0;
-    if (s.tour.on) {
-      s.tour.on = false;
-      s.strokes = [];
-      s.drawing = false;
-      s.dirty = true;
-    }
-    kick();
-  }, [kick]);
+  const loadSample = React.useCallback((digit: number) => {
+    strokes.current = sampleOf(digit);
+    setSample(digit);
+    update();
+  }, [update]);
 
-  const pointOf = (event: React.PointerEvent<HTMLCanvasElement>): [number, number] => {
-    const box = event.currentTarget.getBoundingClientRect();
-    return [((event.clientX - box.left) / box.width) * PAD, ((event.clientY - box.top) / box.height) * PAD];
-  };
+  function position(event: React.PointerEvent<HTMLCanvasElement>): [number, number] {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return [clamp((event.clientX - rect.left) / rect.width) * PAD, clamp((event.clientY - rect.top) / rect.height) * PAD];
+  }
 
-  const onDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
-    if (event.button !== 0) return;
-    event.currentTarget.setPointerCapture(event.pointerId);
-    touch();
-    const s = state.current;
-    s.drawing = true;
-    s.cascade = Infinity;
-    s.strokes = [...s.strokes, [pointOf(event)]];
-    s.dirty = true;
-  };
-  const onMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
-    const s = state.current;
-    if (!s.drawing || s.tour.on) return;
-    const stroke = s.strokes[s.strokes.length - 1];
-    const events = event.nativeEvent.getCoalescedEvents?.() ?? [event.nativeEvent];
-    const box = event.currentTarget.getBoundingClientRect();
-    for (const e of events) {
-      const p: [number, number] = [((e.clientX - box.left) / box.width) * PAD, ((e.clientY - box.top) / box.height) * PAD];
-      const last = stroke[stroke.length - 1];
-      if (Math.hypot(p[0] - last[0], p[1] - last[1]) > 1.5) stroke.push(p);
-    }
-    s.dirty = true;
-    s.touched = 0;
-    kick();
-  };
-  const onUp = (event: React.PointerEvent<HTMLCanvasElement>) => {
-    const s = state.current;
-    if (!s.drawing || s.tour.on) return;
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
-    s.drawing = false;
-    s.touched = 0;
-    recompute();
-    pulse();
-    announce();
-    kick();
-  };
-  const clear = () => {
-    touch();
-    const s = state.current;
-    s.strokes = [];
-    s.drawing = false;
-    s.dirty = true;
-    s.cascade = Infinity;
-    announce();
-  };
-
-  // Hovering a neuron in the first rack shows the 784 weights it looks for on the plate.
-  const showTemplate = (index: number) => {
-    const s = state.current;
-    if (s.template === index) return;
-    nodes.current[`h1-${s.template}`]?.puck?.removeAttribute("data-pick");
-    nodes.current[`h1-${index}`]?.puck?.setAttribute("data-pick", "");
-    s.template = index;
-    paintField();
-    kick();
-  };
-  const onFigureMove = (event: React.PointerEvent<SVGSVGElement>) => {
-    const root = svg.current;
-    if (!root) return;
-    const box = root.getBoundingClientRect();
-    const x = ((event.clientX - box.left) / box.width) * WIDTH;
-    const y = ((event.clientY - box.top) / box.height) * HEIGHT;
-    let best = -1;
-    let bestD = 9;
-    for (let i = 0; i < 16; i++) {
-      const hub = hubs[i];
-      const z = LIFT * Math.max(0, state.current.springs.h1[i].at) * zRise;
-      const d = Math.hypot(x - hub[0], y - (hub[1] - z));
-      if (d < bestD) {
-        bestD = d;
-        best = i;
-      }
-    }
-    showTemplate(best);
-  };
-  const onKey = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    const s = state.current;
-    if (event.key === "ArrowRight" || event.key === "ArrowDown") showTemplate((s.template + 1) % 16);
-    else if (event.key === "ArrowLeft" || event.key === "ArrowUp") showTemplate((s.template + 15) % 16);
-    else if (event.key === "Escape") {
-      if (s.template >= 0) showTemplate(-1);
-      else clear();
-    } else return;
+  function onDown(event: React.PointerEvent<HTMLCanvasElement>) {
+    if (event.button !== 0 || pointer.current !== null) return;
     event.preventDefault();
-  };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    pointer.current = event.pointerId;
+    setDrawing(true);
+    if (sample !== null) strokes.current = [];
+    setSample(null);
+    strokes.current.push([position(event)]);
+    update();
+  }
 
-  const { hubs, zRise } = React.useMemo(() => hubsOf(racks), [racks]);
+  function onMove(event: React.PointerEvent<HTMLCanvasElement>) {
+    if (pointer.current !== event.pointerId) return;
+    strokes.current[strokes.current.length - 1].push(position(event));
+    // Keep the pen responsive while refreshing the model at a calmer cadence.
+    if (frame.current === null) frame.current = requestAnimationFrame(() => { frame.current = null; paint(); });
+    if (inferenceTimer.current === null) {
+      const wait = INFERENCE_INTERVAL - (performance.now() - lastInference.current);
+      if (wait <= 0) update();
+      else inferenceTimer.current = window.setTimeout(update, wait);
+    }
+  }
 
-  return (
-    <div className="dn-hero">
-      <div className="dn-side">
-        {intro}
-        <div className="dn-pad">
-          <canvas
-            ref={pad}
-            className="dn-canvas"
-            width={PAD}
-            height={PAD}
-            role="img"
-            aria-label="Bàn vẽ: dùng chuột, bút hoặc ngón tay viết một chữ số từ 0 đến 9"
-            onPointerDown={onDown}
-            onPointerMove={onMove}
-            onPointerUp={onUp}
-            onPointerCancel={onUp}
-          />
-          <div className="dn-answer" ref={answer} data-empty="" aria-hidden="true">
-            <span className="dn-answer-label">mạng đoán</span>
-            <b>–</b>
-            <i />
-          </div>
-          <div className="dn-pad-bar">
-            <span className="dn-pad-note">viết một chữ số 0–9</span>
-            <button type="button" className="dn-clear" onClick={clear}>
-              Xoá
-            </button>
-          </div>
-          <span className="dn-say" ref={live} aria-live="polite" />
-        </div>
-      </div>
-      <Plate
-        fig="Fig 1"
-        title="Mạng nơ-ron đọc chữ số"
-        hint="Viết vào bàn vẽ · trỏ vào lớp 1"
-        readout="chưa có nét nào"
-        keys={[
-          { mark: "raised", label: "Nơ-ron: nâng càng cao, kích hoạt càng mạnh" },
-          { mark: "edge", label: "Dây: đóng góp w·a, đậm khi lớn" },
-          { mark: "red", label: "Trọng số âm, kìm nơ-ron sau" },
-          { mark: "lit", label: "Chữ số mạng chọn" },
-        ]}
-        caption={`Mạng 784 → 16 → 16 → 10 với 12 730 tham số, huấn luyện trên 60 000 chữ số MNIST, đọc đúng ${accuracy} trên 10 000 chữ số chưa từng thấy. Tấm bên trái là 784 điểm ảnh 28 × 28 mà mạng thực sự nhìn thấy; mỗi nơ-ron lớp 1 cộng cả 784 điểm với trọng số riêng (trỏ vào nó để xem), hai lớp sau cộng các dây nối tới chúng, và lớp cuối chọn chữ số. Mọi con số đều do chính mô hình này tính trong trình duyệt.`}
-      >
-        <div ref={stage} className="iso-stage dn-stage" tabIndex={0} role="group" aria-label="Mạng nơ-ron: phím mũi tên chọn một nơ-ron lớp 1 để xem trọng số, Esc để thoát" onKeyDown={onKey} onBlur={() => showTemplate(-1)}>
-          <svg
-            ref={svg}
-            className="iso-svg dn-svg"
-            viewBox={`0 0 ${WIDTH} ${HEIGHT}`}
-            role="img"
-            aria-label="Một bàn thí nghiệm: tấm cảm biến 28 × 28 điểm ảnh, hai giá 16 nơ-ron và một giá 10 nơ-ron đầu ra, nối với nhau bằng dây trên mặt bàn. Nơ-ron nâng lên khi được kích hoạt."
-            focusable="false"
-            onPointerMove={onFigureMove}
-            onPointerDown={onFigureMove}
-            onPointerLeave={() => showTemplate(-1)}
-          >
-            {base}
-            {webs}
-            {plate}
-            {racks.map((rack) => (
-              <g key={rack.key} data-rack={rack.key}>
-                {rack.rail}
-                {rack.nodes.map((node) => (
-                  <g key={node.key}>
-                    {node.socket}
-                    <g
-                      className="iso-solid dn-rod"
-                      ref={(el) => {
-                        (nodes.current[node.key] ??= { puck: null, rod: null }).rod = el;
-                      }}
-                    >
-                      <path className="iso-fill" d={node.rod.fill} />
-                      <path className="iso-shade" data-shade="1" d={node.rod.side} />
-                      <path className="iso-line iso-edge" data-tone="mid" d={node.rod.outline} />
-                    </g>
-                    <g
-                      ref={(el) => {
-                        (nodes.current[node.key] ??= { puck: null, rod: null }).puck = el;
-                      }}
-                    >
-                      {node.puck}
-                    </g>
-                    {node.knob}
-                  </g>
-                ))}
-                {rack.front}
-              </g>
-            ))}
-            {result}
-          </svg>
-        </div>
-      </Plate>
-    </div>
-  );
+  function onUp(event: React.PointerEvent<HTMLCanvasElement>) {
+    if (pointer.current !== event.pointerId) return;
+    if (event.type !== "pointercancel" && event.type !== "lostpointercapture") strokes.current[strokes.current.length - 1].push(position(event));
+    pointer.current = null;
+    setDrawing(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    update();
+  }
+
+  function clear() {
+    if (frame.current !== null) { cancelAnimationFrame(frame.current); frame.current = null; }
+    pointer.current = null;
+    strokes.current = [];
+    setDrawing(false);
+    setSample(null);
+    update();
+  }
+
+  return <div className="dn-hero">
+    <section className="dn-experiment" aria-label="Thử mạng nơ-ron nhận diện chữ số">
+      <div className="dn-topline"><span><span className="dn-status-dot" />Mạng nơ-ron · trực tiếp</span><span>784 → 16 → 16 → 10</span></div>
+      <Network pass={pass} selection={selection} select={setSelection} drawing={drawing} sample={sample}
+        input={<div className="dn-pad-wrap">
+          <canvas id="digit-pad" ref={pad} width={PAD} height={PAD} className="dn-canvas" role="img" aria-label="Đầu vào của mạng: viết trực tiếp chữ số từ 0 đến 9 bằng chuột, bút hoặc ngón tay" onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp} onLostPointerCapture={onUp} />
+          {!pass && !drawing && <span className="dn-pad-placeholder" aria-hidden="true">Viết ở đây</span>}
+        </div>}
+        controls={<div className="dn-input-controls">
+          <button className="dn-text-button dn-clear" type="button" onClick={clear}>Xóa ↺</button>
+          <button className="dn-text-button" type="button" aria-label="Thử nét mẫu tiếp theo" onClick={() => { tour.current = (tour.current + 1) % TOUR.length; loadSample(TOUR[tour.current]); }}>Thử mẫu ↗</button>
+        </div>}
+      />
+      <span className="dn-sr-only" role="status" aria-live="polite">{pass ? `Mạng đoán số ${pass.digit}, xác suất ${percent(pass.probs[pass.digit])}` : "Bảng viết trống"}</span>
+    </section>
+    <div className="dn-intro">{intro}</div>
+  </div>;
 }
-
-function hubsOf(racks: RackArt[]) {
-  // Screen positions of the first rack's puck tops at rest, and screen px per unit of lift.
-  const first = racks[0].nodes;
-  const hubs: [number, number][] = [];
-  for (const node of first) hubs[node.index] = hubAt(node.x, node.y);
-  return { hubs, zRise: zRiseOf() };
-}
-
-const hubAt = (x: number, y: number) => at([x, y, PUCK_REST + PUCK_H]);
-const zRiseOf = () => -EZ[1];
