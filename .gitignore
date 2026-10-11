@@ -1,0 +1,13 @@
+# Only the landing page and its training code live in this repo.
+/.agents/
+/skills-lock.json
+/computer*.html
+.DS_Store
+
+# MNIST is downloaded by training/fetch_mnist.sh
+/training/data/
+__pycache__/
+
+# Verification screenshots and the local capture helper
+/landing/shots/
+/landing/shoot.sh
